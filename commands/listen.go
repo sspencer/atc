@@ -1,18 +1,15 @@
 package commands
 
 import (
-	"context"
-	"errors"
-	"fmt"
+	"encoding/json"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -26,13 +23,15 @@ func newListenCmd(v *viper.Viper) *cobra.Command {
 		Use:   "listen",
 		Short: "Listen for HTTP traffic and log each request",
 		Long: `Listen starts an HTTP server that accepts any request, logs its method,
-path, and body, and replies with 200 OK. It is a debugging aid for checking
-that atc forwards traffic.`,
+path, and body, and replies with 200 OK and a JSON body describing the
+request: method, URL, query, protocol, host, remote address, headers, content
+length, body size, and the body itself (base64-encoded if it isn't valid
+UTF-8). It is a debugging aid for checking that atc forwards traffic.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			port := v.GetInt("port")
-			if port < 1 || port > 65535 {
-				return fmt.Errorf("invalid port %d: must be between 1 and 65535", port)
+			addr, err := listenAddr(v.GetInt("port"))
+			if err != nil {
+				return err
 			}
 
 			logger, err := newLogger(cmd.OutOrStdout(), v.GetString("log-format"))
@@ -43,7 +42,7 @@ that atc forwards traffic.`,
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			return listen(ctx, net.JoinHostPort("", strconv.Itoa(port)), logger)
+			return runServer(ctx, addr, requestLogger(logger), logger)
 		},
 	}
 
@@ -51,41 +50,31 @@ that atc forwards traffic.`,
 	return cmd
 }
 
-// listen serves requestLogger on addr until ctx is cancelled.
-func listen(ctx context.Context, addr string, logger *slog.Logger) error {
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           requestLogger(logger),
-		ReadHeaderTimeout: 10 * time.Second,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
-	}
-
-	errCh := make(chan error, 1)
-	go func() {
-		logger.Info("listening", "addr", addr)
-		errCh <- srv.ListenAndServe()
-	}()
-
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		logger.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return err
-		}
-		if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	}
+// requestInfo is the JSON body listen sends back for each request.
+type requestInfo struct {
+	Method           string              `json:"method"`
+	URL              string              `json:"url"`
+	Path             string              `json:"path"`
+	Query            map[string][]string `json:"query,omitempty"`
+	Proto            string              `json:"proto"`
+	Host             string              `json:"host"`
+	RemoteAddr       string              `json:"remote_addr"`
+	TLS              bool                `json:"tls"`
+	Headers          map[string][]string `json:"headers"`
+	ContentLength    int64               `json:"content_length"`
+	TransferEncoding []string            `json:"transfer_encoding,omitempty"`
+	BodySize         int64               `json:"body_size"`
+	Body             string              `json:"body,omitempty"`
+	BodyBase64       []byte              `json:"body_base64,omitempty"`
+	BodyTruncated    bool                `json:"body_truncated,omitempty"`
+	ReceivedAt       time.Time           `json:"received_at"`
 }
 
-// requestLogger returns a handler that logs each request and replies 200 OK.
+// requestLogger returns a handler that logs each request and replies 200 OK
+// with a JSON description of it.
 func requestLogger(logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received := time.Now()
 		attrs := []any{
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.RequestURI()),
@@ -98,17 +87,54 @@ func requestLogger(logger *slog.Logger) http.Handler {
 			return
 		}
 
-		if len(body) > maxLoggedBody {
+		size := int64(len(body))
+		truncated := len(body) > maxLoggedBody
+		if truncated {
 			body = body[:maxLoggedBody]
 			attrs = append(attrs, slog.Bool("truncated", true))
-			// Drain the rest so the client isn't left hanging.
-			_, _ = io.Copy(io.Discard, r.Body)
+			// Drain the rest so the client isn't left hanging, counting it
+			// so the reported size is the full body size.
+			n, _ := io.Copy(io.Discard, r.Body)
+			size += n
 		}
 		if len(body) > 0 {
 			attrs = append(attrs, slog.String("body", string(body)))
 		}
 
 		logger.Info("request", attrs...)
+
+		info := requestInfo{
+			Method:           r.Method,
+			URL:              r.URL.RequestURI(),
+			Path:             r.URL.Path,
+			Query:            r.URL.Query(),
+			Proto:            r.Proto,
+			Host:             r.Host,
+			RemoteAddr:       r.RemoteAddr,
+			TLS:              r.TLS != nil,
+			Headers:          r.Header,
+			ContentLength:    r.ContentLength,
+			TransferEncoding: r.TransferEncoding,
+			BodySize:         size,
+			BodyTruncated:    truncated,
+			ReceivedAt:       received,
+		}
+		if len(info.Query) == 0 {
+			info.Query = nil
+		}
+		// Echo text bodies as-is; binary bodies as base64.
+		if utf8.Valid(body) {
+			info.Body = string(body)
+		} else {
+			info.BodyBase64 = body
+		}
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(info); err != nil {
+			logger.Error("error writing response", append(attrs, slog.Any("error", err))...)
+		}
 	})
 }
