@@ -1,0 +1,602 @@
+# gateway.toml: an example atc configuration for a typical API gateway.
+#
+# This file imagines atc in its finished form. Most of what it shows is not
+# implemented yet; see docs/ideas.md. It is a design sketch to argue with,
+# not a reference.
+#
+# The scenario: Acme runs a public API at api.acme.example, a web app at
+# app.acme.example and a webhook endpoint at hooks.acme.example. Behind atc:
+#
+#   users       REST, three instances behind a load balancer
+#   orders      REST, a stable v1 and a v2 canary
+#   catalog     REST, public and cached
+#   search      REST, found through DNS service discovery
+#   payments    REST over mutual TLS
+#   inventory   gRPC
+#   notify      WebSockets for live notifications
+#   billing     a legacy SOAP/XML service, adapted by a script
+#   grafana     an internal tool behind single sign-on
+#   web         the web app's static files, served by atc itself
+#
+# Conventions used throughout:
+#   Durations   "250ms", "5s", "2m", "1h"
+#   Sizes       "16KB", "10MB", "1GB"
+#   Rates       "100/s", "60/m", "10000/day"
+#   Secrets     "${NAME}" reads an environment variable;
+#               "${file:/path}" reads a file (Docker or Kubernetes secrets)
+#   Placeholders in paths and headers, filled in per request:
+#               {path}  {query}  {host}  {client_ip}  {request_id}
+#               {param.NAME}  from a :NAME segment in a route's path
+#               {claim.NAME}  from a validated JWT
+#               {consumer}    the authenticated consumer's name
+#
+# Precedence: command-line flags, then ATC_* environment variables, then this
+# file, then built-in defaults. `atc config validate gateway.toml` checks the
+# file, and `atc config print` shows the merged result.
+
+version = 1   # config schema version, so future atc releases can migrate it
+
+# Merge more files in, sorted by name. Teams can own their own route files.
+include = ["conf.d/*.toml"]
+
+# -----------------------------------------------------------------------------
+# Gateway-wide settings
+# -----------------------------------------------------------------------------
+
+[gateway]
+name              = "acme-edge"   # shown in the admin UI, logs and metrics
+graceful_shutdown = "30s"         # time to drain in-flight requests on stop
+
+# Only believe X-Forwarded-For from these proxies (the cloud load balancer).
+# Client IPs for rate limits, IP filters and logs come from here.
+trusted_proxies = ["10.0.0.0/8"]
+
+[config]
+store  = "file"   # or "sqlite:/var/lib/atc/atc.db" to edit config in the admin UI
+watch  = true     # reload when this file or an included file changes
+                  # SIGHUP reloads too; a config that fails validation is
+                  # rejected and the running one stays
+
+# Errors atc generates itself (502, 504, 429, 401, ...) use RFC 9457
+# problem details, so clients get one error shape from every service.
+[errors]
+format         = "problem+json"
+include_detail = false   # never leak upstream error text to clients
+
+# -----------------------------------------------------------------------------
+# Listeners: where atc accepts traffic
+# -----------------------------------------------------------------------------
+
+[listener.http]
+address           = ":80"
+redirect_to_https = true   # ACME HTTP-01 challenges are still answered here
+
+[listener.https]
+address   = ":443"
+protocols = ["h1", "h2", "h3"]   # HTTP/3 over QUIC as well
+tls       = "acme"               # certificates from [tls.acme] below
+
+[listener.https.timeouts]
+read_header = "10s"
+idle        = "2m"
+
+[listener.https.limits]
+max_header_size = "32KB"
+max_body_size   = "10MB"   # routes can raise or lower this
+max_connections = 20000
+
+# A plain-HTTP listener on the private network for service-to-service calls.
+[listener.internal]
+address = "10.0.1.5:8080"
+
+# -----------------------------------------------------------------------------
+# TLS
+# -----------------------------------------------------------------------------
+
+[tls.acme]
+email     = "ops@acme.example"
+directory = "https://acme-v02.api.letsencrypt.org/directory"
+storage   = "/var/lib/atc/certs"
+domains   = ["api.acme.example", "app.acme.example", "hooks.acme.example"]
+
+# Certificates from files work too, for example on the internal listener:
+# [tls.certs.internal]
+# cert = "/etc/atc/tls/internal.crt"
+# key  = "/etc/atc/tls/internal.key"
+
+# -----------------------------------------------------------------------------
+# Admin API and UI
+# -----------------------------------------------------------------------------
+
+[admin]
+address = "127.0.0.1:9901"   # never on a public interface
+ui      = true               # web UI at http://127.0.0.1:9901/
+
+# The API takes a bearer token; people sign in to the UI with SSO.
+[admin.auth]
+token = "${ATC_ADMIN_TOKEN}"
+oidc  = "corp-sso"   # an [oidc.*] provider, defined below
+
+# The live traffic view streams requests to the UI over server-sent events.
+[admin.traffic]
+enabled        = true
+buffer         = 1000    # last N requests, so the view isn't empty when opened
+keepalive      = "15s"   # SSE comment interval, keeps idle proxies from closing
+capture_bodies = false   # turn on while debugging; bodies are capped below
+max_body       = "16KB"
+redact_headers = ["Authorization", "Cookie", "Set-Cookie", "X-Api-Key"]
+
+# -----------------------------------------------------------------------------
+# Observability
+# -----------------------------------------------------------------------------
+
+[log]
+level  = "info"
+format = "json"
+
+[log.access]
+enabled = true
+path    = "/var/log/atc/access.log"   # "-" for stdout
+format  = "json"                      # or "combined" for classic log tools
+fields  = ["time", "request_id", "client_ip", "consumer", "method", "path",
+           "route", "upstream", "target", "status", "bytes", "duration"]
+
+[request_id]
+header         = "X-Request-ID"
+trust_incoming = true      # keep a caller's ID; generate one otherwise
+generator      = "uuidv7"  # time-ordered, sorts nicely in logs
+
+[metrics]
+prometheus = true          # /metrics on the admin listener
+labels     = ["route", "upstream", "status_class", "consumer"]
+
+[tracing]
+exporter    = "otlp"
+endpoint    = "otel-collector.internal:4317"
+sample_rate = 0.05
+propagation = ["tracecontext", "baggage"]
+
+# -----------------------------------------------------------------------------
+# Defaults for every route and upstream (each can override)
+# -----------------------------------------------------------------------------
+
+[defaults]
+# Middleware every route runs first, in this order. A route's own list runs
+# after these. Middleware are defined under [middleware.*] below.
+middleware = ["security-headers", "compress"]
+
+[defaults.timeouts]
+connect         = "2s"
+response_header = "15s"   # time for the upstream to start answering
+total           = "30s"
+
+[defaults.retry]
+attempts = 2
+on       = ["connect-failure", "reset", "502", "503"]
+methods  = ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]   # idempotent only
+backoff  = "50ms"     # doubled each attempt, with jitter
+budget   = 0.2        # retries may add at most 20% extra load to an upstream
+
+# -----------------------------------------------------------------------------
+# Upstreams: the services behind atc
+# -----------------------------------------------------------------------------
+
+[upstream.users]
+balance = "least-conn"   # or "round-robin", "random", "ip-hash", "consistent-hash"
+targets = [
+  { url = "http://users-1.internal:8080" },
+  { url = "http://users-2.internal:8080" },
+  { url = "http://users-3.internal:8080", weight = 2 },   # a bigger machine
+]
+
+# Active checks: probe each target and take failing ones out of rotation.
+[upstream.users.health]
+path                = "/healthz"
+interval            = "5s"
+timeout             = "1s"
+healthy_threshold   = 2
+unhealthy_threshold = 3
+
+# Passive checks: eject a target that keeps failing real requests.
+[upstream.users.circuit_breaker]
+consecutive_errors = 5
+eject_for          = "30s"   # grows each time the same target is ejected
+max_ejected        = "50%"   # never take out more than half the targets
+
+[upstream.users.pool]
+max_idle     = 100
+idle_timeout = "90s"
+
+[upstream.orders-v1]
+targets = [
+  { url = "http://orders-v1-a.internal:8080" },
+  { url = "http://orders-v1-b.internal:8080" },
+]
+health = { path = "/healthz", interval = "5s" }
+
+[upstream.orders-v2]
+targets = [{ url = "http://orders-v2.internal:8080" }]
+health  = { path = "/healthz", interval = "5s" }
+
+[upstream.catalog]
+targets = [
+  { url = "http://catalog-1.internal:8080" },
+  { url = "http://catalog-2.internal:8080" },
+]
+
+# Targets found through DNS SRV records (Consul, Kubernetes headless services),
+# refreshed as instances come and go.
+[upstream.search]
+discovery = { type = "dns-srv", name = "_http._tcp.search.service.consul", refresh = "10s" }
+balance   = "round-robin"
+
+[upstream.search-next]   # the rewrite in progress; receives mirrored traffic
+targets = [{ url = "http://search-next.internal:8080" }]
+
+# Mutual TLS to the payments service, with its own CA.
+[upstream.payments]
+targets = [{ url = "https://payments.internal:8443" }]
+
+[upstream.payments.tls]
+ca          = "/etc/atc/tls/payments-ca.pem"
+cert        = "/etc/atc/tls/atc-client.pem"
+key         = "${file:/run/secrets/atc-client-key}"
+server_name = "payments.internal"
+
+# gRPC over cleartext HTTP/2.
+[upstream.inventory]
+protocol = "h2c"
+targets  = [
+  { url = "http://inventory-1.internal:9090" },
+  { url = "http://inventory-2.internal:9090" },
+]
+health = { grpc_service = "acme.inventory.v1.Inventory", interval = "5s" }
+
+[upstream.notify]
+balance = "consistent-hash"   # same user, same instance, for long-lived sockets
+hash_on = "{claim.sub}"
+targets = [
+  { url = "http://notify-1.internal:8080" },
+  { url = "http://notify-2.internal:8080" },
+]
+
+# The legacy billing system is slow and fragile: one target, long timeouts,
+# and a low concurrency cap so a traffic spike can't knock it over.
+[upstream.billing]
+targets         = [{ url = "http://billing.legacy.internal:7001" }]
+max_concurrent  = 20     # extra requests wait in a queue...
+queue_timeout   = "2s"   # ...and get a 503 if they wait longer than this
+timeouts        = { response_header = "45s", total = "60s" }
+
+[upstream.grafana]
+targets = [{ url = "http://grafana.internal:3000" }]
+
+# -----------------------------------------------------------------------------
+# Consumers and plans: who calls the API, and how much they may
+# -----------------------------------------------------------------------------
+# Consumers can also be managed through the admin API and stored in SQLite.
+
+[plan.free]
+rate  = "60/m"
+burst = 20
+quota = "10000/month"
+
+[plan.pro]
+rate  = "1000/m"
+burst = 200
+quota = "5000000/month"
+
+[plan.partner]
+rate  = "5000/m"
+burst = 1000
+# no quota: billed by usage, which the access log records per consumer
+
+[consumer.mobile-app]
+plan = "pro"
+keys = ["${file:/run/secrets/mobile-app-key}"]
+
+[consumer.partner-globex]
+plan   = "partner"
+keys   = ["${GLOBEX_API_KEY}"]
+routes = ["orders", "catalog", "inventory"]   # may only call these
+allow  = ["203.0.113.0/24"]                   # and only from their network
+
+[consumer.hobbyist-42]
+plan = "free"
+keys = ["${file:/run/secrets/hobbyist-42-key}"]
+
+# -----------------------------------------------------------------------------
+# Identity providers
+# -----------------------------------------------------------------------------
+
+[jwt.acme-auth]
+jwks_url  = "https://auth.acme.example/.well-known/jwks.json"
+issuer    = "https://auth.acme.example/"
+audiences = ["api.acme.example"]
+leeway    = "30s"   # allowed clock skew
+
+[oidc.corp-sso]
+issuer        = "https://sso.acme.example"
+client_id     = "atc"
+client_secret = "${file:/run/secrets/oidc-client-secret}"
+cookie_secret = "${file:/run/secrets/oidc-cookie-secret}"
+allowed_groups = ["engineering", "support"]
+
+# -----------------------------------------------------------------------------
+# Middleware: reusable steps that routes list by name
+# -----------------------------------------------------------------------------
+# Each has a `type`. Routes run their middleware in the order listed, after
+# [defaults].middleware. Requests pass through in order; responses come back
+# through them in reverse.
+
+[middleware.security-headers]
+type            = "headers"
+response.set    = { "Strict-Transport-Security" = "max-age=63072000; includeSubDomains", "X-Content-Type-Options" = "nosniff", "Referrer-Policy" = "strict-origin-when-cross-origin" }
+response.remove = ["Server", "X-Powered-By"]
+
+[middleware.compress]
+type       = "compress"
+algorithms = ["zstd", "br", "gzip"]   # in order of preference
+min_size   = "1KB"
+types      = ["application/json", "text/*", "application/javascript", "image/svg+xml"]
+
+[middleware.cors]
+type              = "cors"
+allow_origins     = ["https://app.acme.example", "https://*.acme-preview.example"]
+allow_methods     = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+allow_headers     = ["Authorization", "Content-Type", "X-Request-ID"]
+expose_headers    = ["X-Request-ID", "RateLimit", "RateLimit-Policy"]
+allow_credentials = true
+max_age           = "10m"
+
+# Validate a bearer token and pass the caller's identity upstream.
+[middleware.user-auth]
+type              = "jwt"
+provider          = "acme-auth"
+claims_to_headers = { sub = "X-User-ID", scope = "X-User-Scopes" }
+token_query       = "access_token"   # also accepted, for WebSocket handshakes
+strip_token       = false            # upstreams also verify the token themselves
+
+[middleware.require-orders-scope]
+type   = "jwt-scopes"
+any_of = ["orders:read", "orders:write"]
+
+# API keys for partners and apps; the key identifies a [consumer.*].
+[middleware.api-key]
+type   = "key-auth"
+header = "X-Api-Key"
+query  = "api_key"   # accepted, but logged as a warning
+hide   = true        # remove the key before forwarding
+
+# Either a user token or an API key is enough.
+[middleware.any-auth]
+type   = "any"
+of     = ["user-auth", "api-key"]
+
+# Limits come from the consumer's plan; anonymous callers are limited by IP.
+# Responses carry RateLimit and RateLimit-Policy headers (IETF draft).
+[middleware.rate-limit]
+type      = "rate-limit"
+key       = "consumer"
+anonymous = { key = "client_ip", rate = "30/m", burst = 10 }
+store     = "memory"   # "redis://redis.internal:6379" to share across instances
+
+[middleware.catalog-cache]
+type                   = "cache"
+ttl                    = "60s"   # when the upstream sends no Cache-Control
+stale_while_revalidate = "30s"
+stale_if_error         = "10m"   # keep serving if catalog goes down
+vary                   = ["Accept-Language", "Accept-Encoding"]
+max_size               = "512MB"
+
+[middleware.office-only]
+type  = "ip-filter"
+allow = ["198.51.100.0/24", "10.0.0.0/8"]
+
+[middleware.sso]
+type     = "oidc"
+provider = "corp-sso"
+
+[middleware.uploads]
+type          = "body-limit"
+max_body_size = "100MB"
+
+# Scripts: Lua run inside atc. A script defines on_request and/or
+# on_response, gets the request (and response) as tables, and can change
+# them or answer directly.
+[middleware.verify-webhook]
+type = "script"
+file = "scripts/verify_stripe_signature.lua"
+body = "read"   # the script needs the raw body; buffered up to max_body_size
+
+# Short scripts can live inline.
+[middleware.billing-json-to-soap]
+type   = "script"
+body   = "read-write"
+source = '''
+local xml = require("xml")
+
+function on_request(req)
+  local invoice = req:json()
+  req.headers["Content-Type"] = "text/xml; charset=utf-8"
+  req.headers["SOAPAction"]   = "urn:billing#GetInvoice"
+  req:set_body(xml.envelope("GetInvoice", { InvoiceId = invoice.id }))
+end
+
+function on_response(req, res)
+  if res.status ~= 200 then return end
+  local doc = xml.parse(res:body())
+  res.headers["Content-Type"] = "application/json"
+  res:set_json({
+    id     = doc:text("//InvoiceId"),
+    total  = tonumber(doc:text("//Amount")),
+    status = doc:text("//Status"):lower(),
+  })
+end
+'''
+
+[scripting]
+engine       = "lua"
+paths        = ["/etc/atc"]   # where `file =` paths are resolved
+pool_size    = 64             # preloaded VMs per script
+timeout      = "50ms"         # per hook call
+memory_limit = "32MB"         # per VM
+allow        = ["json", "xml", "base64", "crypto", "log"]   # no file or network access
+
+# -----------------------------------------------------------------------------
+# Routes: which requests go where
+# -----------------------------------------------------------------------------
+# The most specific match wins: exact path over prefix, longer prefix over
+# shorter, then host, method and header matchers. `priority` breaks ties
+# (higher wins). Routes listen on "https" unless they name other listeners.
+
+# Users: REST with a stripped version prefix.
+[[route]]
+name         = "users"
+upstream     = "users"
+middleware   = ["cors", "user-auth", "rate-limit"]
+strip_prefix = "/v1"   # /v1/users/7 is forwarded as /users/7
+match        = { host = "api.acme.example", path_prefix = "/v1/users" }
+
+# Orders: 95% to v1 and 5% to the v2 canary. A request is pinned to the
+# version it first got, so a user doesn't flip between them.
+[[route]]
+name       = "orders"
+middleware = ["cors", "any-auth", "require-orders-scope", "rate-limit"]
+match      = { host = "api.acme.example", path_prefix = "/v1/orders" }
+split      = [
+  { upstream = "orders-v1", weight = 95 },
+  { upstream = "orders-v2", weight = 5 },
+]
+sticky     = { cookie = "atc_orders_version", ttl = "24h" }
+
+# Testers force the canary with a header.
+[[route]]
+name       = "orders-canary-forced"
+upstream   = "orders-v2"
+middleware = ["cors", "any-auth", "require-orders-scope", "rate-limit"]
+priority   = 10
+match      = { host = "api.acme.example", path_prefix = "/v1/orders", headers = { "X-Canary" = "1" } }
+
+# Catalog: public, read-only and cached.
+[[route]]
+name       = "catalog"
+upstream   = "catalog"
+middleware = ["cors", "rate-limit", "catalog-cache"]
+match      = { host = "api.acme.example", path_prefix = "/v1/catalog", methods = ["GET", "HEAD"] }
+
+# Search: also mirrored to the rewrite, whose responses are discarded but
+# compared in the admin UI.
+[[route]]
+name       = "search"
+upstream   = "search"
+middleware = ["cors", "rate-limit"]
+match      = { host = "api.acme.example", path_prefix = "/v1/search" }
+mirror     = { upstream = "search-next", percent = 10, compare = true }
+
+# Product image uploads: a bigger body limit and a longer timeout.
+[[route]]
+name       = "catalog-images"
+upstream   = "catalog"
+middleware = ["cors", "user-auth", "uploads"]
+match      = { host = "api.acme.example", path = "/v1/catalog/:product/images", methods = ["POST"] }
+timeouts   = { total = "5m" }
+retry      = { attempts = 0 }
+
+# One call, several services: the app's home screen fetches the profile,
+# recent orders and recommendations in one request. atc calls the backends
+# in parallel and merges the JSON responses under the given keys.
+[[route]]
+name       = "dashboard"
+middleware = ["cors", "user-auth", "rate-limit"]
+match      = { host = "api.acme.example", path = "/v1/me/dashboard", methods = ["GET"] }
+
+[route.aggregate]
+timeout = "800ms"
+partial = true   # return what arrived in time, and say which parts are missing
+
+[[route.aggregate.backend]]
+key      = "profile"
+upstream = "users"
+path     = "/users/{claim.sub}"
+fields   = ["id", "name", "avatar_url"]   # keep only these
+
+[[route.aggregate.backend]]
+key      = "recent_orders"
+upstream = "orders-v1"
+path     = "/orders?customer={claim.sub}&limit=5"
+
+[[route.aggregate.backend]]
+key      = "recommendations"
+upstream = "catalog"
+path     = "/recommendations/{claim.sub}"
+optional = true   # the dashboard still works without it
+
+# Stripe webhooks: verify the signature in a script, and never retry, since
+# payment events must not be applied twice.
+[[route]]
+name         = "stripe-webhooks"
+upstream     = "payments"
+middleware   = ["verify-webhook"]
+match        = { host = "hooks.acme.example", path = "/stripe", methods = ["POST"] }
+rewrite      = { path = "/webhooks/stripe" }
+retry        = { attempts = 0 }
+request.set  = { "X-Webhook-Source" = "stripe" }
+
+# gRPC: routed by service name, from the gRPC path.
+[[route]]
+name       = "inventory"
+upstream   = "inventory"
+middleware = ["user-auth", "rate-limit"]
+match      = { host = "api.acme.example", grpc_service = "acme.inventory.v1.Inventory" }
+
+# WebSockets for live notifications. Browsers can't set headers on a
+# WebSocket handshake, so the token comes in ?access_token= (see user-auth).
+[[route]]
+name       = "notifications"
+upstream   = "notify"
+middleware = ["user-auth"]
+match      = { host = "api.acme.example", path = "/v1/notifications", websocket = true }
+timeouts   = { idle = "1h" }
+
+# Legacy billing: a modern JSON path in front of a SOAP service.
+[[route]]
+name       = "invoices"
+upstream   = "billing"
+middleware = ["cors", "user-auth", "rate-limit", "billing-json-to-soap"]
+match      = { host = "api.acme.example", path = "/v1/invoices/:id", methods = ["GET"] }
+rewrite    = { path = "/BillingService/Invoice" }
+
+# Reports are being rebuilt: answer directly without an upstream.
+[[route]]
+name    = "reports-maintenance"
+match   = { host = "api.acme.example", path_prefix = "/v1/reports" }
+respond = { status = 503, headers = { "Retry-After" = "3600" }, json = { title = "Reports are down for maintenance", retry_after = 3600 } }
+
+# Old clients used /api/; send them to /v1/ permanently.
+[[route]]
+name     = "legacy-api-paths"
+match    = { host = "api.acme.example", path_prefix = "/api/" }
+redirect = { to = "/v1/{path}", status = 308, strip_prefix = "/api" }
+
+# Internal dashboards: office network and single sign-on, on both listeners.
+[[route]]
+name         = "grafana"
+upstream     = "grafana"
+listeners    = ["https", "internal"]
+middleware   = ["office-only", "sso"]
+match        = { host = "app.acme.example", path_prefix = "/grafana" }
+request.set  = { "X-WEBAUTH-USER" = "{claim.email}" }   # Grafana's auth proxy header
+
+# The web app: static files with a single-page-app fallback.
+[[route]]
+name   = "web"
+match  = { host = "app.acme.example" }
+static = { root = "/srv/acme-web", index = "index.html", spa_fallback = true, immutable = ["/assets/*"] }
+
+# Anything else on the API host: a JSON 404 rather than a bare one.
+[[route]]
+name     = "api-not-found"
+priority = -100
+match    = { host = "api.acme.example" }
+respond  = { status = 404, json = { title = "Not found", detail = "No API route matches {path}" } }
