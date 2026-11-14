@@ -1,0 +1,21 @@
+# Build output
+/bin/
+
+# Go test and profiling artifacts
+*.test
+*.out
+*.prof
+coverage.*
+
+# Local environment overrides
+.env
+.env.local
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# macOS
+.DS_Store
