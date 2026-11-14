@@ -20,7 +20,7 @@ func newRootCmd() *cobra.Command {
 
 	root := &cobra.Command{
 		Use:           "atc",
-		Short:         "atc is an API proxy",
+		Short:         "atc is an API gateway",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
