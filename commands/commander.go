@@ -2,6 +2,8 @@
 package commands
 
 import (
+	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -28,10 +30,19 @@ func newRootCmd() *cobra.Command {
 			v.SetEnvPrefix("ATC")
 			v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 			v.AutomaticEnv()
-			return v.BindPFlags(cmd.Flags())
+			if err := v.BindPFlags(cmd.Flags()); err != nil {
+				return err
+			}
+			// Reject a bad --log-format up front, whichever command runs.
+			_, err := newLogger(io.Discard, v.GetString("log-format"))
+			return err
 		},
 	}
 
+	root.PersistentFlags().String("log-format", logFormatText,
+		fmt.Sprintf("log output format (%s or %s)", logFormatText, logFormatJSON))
+
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newListenCmd(v))
 	return root
 }
